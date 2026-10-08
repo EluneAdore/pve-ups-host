@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""PVE UPS HID 管理入口。只管理已经安装的 pve-ups-hid v2，不修改监控核心。"""
+import datetime
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+BIN = '/usr/local/sbin/pve-ups-hid'
+CONF = Path('/etc/default/pve-ups-hid')
+TIMER = 'pve-ups-hid.timer'
+SERVICE = 'pve-ups-hid.service'
+DROPIN = Path('/etc/systemd/system/pve-ups-hid.timer.d/10-interval.conf')
+STATE = Path('/run/pve-ups-hid.state')
+
+
+class ConfigError(Exception):
+    pass
+
+
+def cmd(*args, check=True, timeout=12, capture=False):
+    return subprocess.run(args, check=check, timeout=timeout,
+                          text=True, capture_output=capture)
+
+
+def require_installed():
+    if os.geteuid() != 0:
+        raise ConfigError('请使用 root 执行该命令')
+    if not Path(BIN).is_file() or not CONF.is_file():
+        raise ConfigError('未发现已安装的 pve-ups-hid v2；未修改任何文件')
+    if not Path('/etc/systemd/system/pve-ups-hid.timer').is_file():
+        raise ConfigError('未发现 pve-ups-hid.timer；未修改任何文件')
+
+
+def settings():
+    content = CONF.read_text(encoding='utf-8')
+    values = {}
+    for key in ('UPS_MODE', 'UPS_TIMEOUT'):
+        found = re.findall(r'^' + key + r'=([^\n#]*)$', content, re.M)
+        if len(found) != 1:
+            raise ConfigError(f'{CONF} 中 {key} 不存在或有重复配置，请先人工检查')
+        values[key] = found[0].strip()
+    if values['UPS_MODE'] not in ('dry-run', 'live'):
+        raise ConfigError('配置中的 UPS_MODE 无效')
+    try:
+        seconds = int(values['UPS_TIMEOUT'])
+    except ValueError as exc:
+        raise ConfigError('配置中的 UPS_TIMEOUT 无效') from exc
+    if seconds < 1 or (values['UPS_MODE'] == 'live' and seconds != 1800):
+        raise ConfigError('配置不符合监控程序要求：正式模式只能使用1800秒')
+    return content, values['UPS_MODE'], seconds
+
+
+def read_ups():
+    r = cmd(BIN, 'probe', check=False, timeout=8, capture=True)
+    output = (r.stdout + r.stderr).strip()
+    if r.returncode:
+        raise ConfigError(f'UPS 检测失败：{output or "无错误详情"}')
+    m = re.search(r'UPS 放电状态：([01])（', output)
+    if not m:
+        raise ConfigError(f'无法识别 UPS 探测输出：{output}')
+    return int(m.group(1))
+
+
+def power_guard():
+    power = read_ups()
+    if power != 0:
+        raise ConfigError('UPS 当前正在电池供电；请恢复市电后再修改此项')
+
+
+def atomic_write(path, data, mode=0o644):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.pve-ups-', dir=str(path.parent))
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def update_config(mode, timeout):
+    original, old_mode, old_timeout = settings()
+    if old_mode == mode and old_timeout == timeout:
+        print('配置没有变化。')
+        return
+    updated = re.sub(r'^UPS_MODE=[^\n]*$', 'UPS_MODE=' + mode, original, count=1, flags=re.M)
+    updated = re.sub(r'^UPS_TIMEOUT=[^\n]*$', 'UPS_TIMEOUT=' + str(timeout), updated,
+                     count=1, flags=re.M)
+    # 留一份独立备份，不覆盖用户之前的 .bak
+    stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S-%f')
+    backup = CONF.with_name(CONF.name + '.menu-bak-' + stamp)
+    shutil.copy2(CONF, backup)
+    mode_bits = stat.S_IMODE(CONF.stat().st_mode)
+    atomic_write(CONF, updated, mode_bits)
+    print(f'已更新：{CONF}')
+    print(f'修改前备份：{backup}')
+    print('下一个监控周期生效；修改模式或阈值后，原倒计时会重新计算。')
+
+
+def change_live():
+    _, mode, timeout = settings()
+    if mode == 'live' and timeout == 1800:
+        print('当前已是正式模式：连续停电30分钟触发 PVE 正常关机。')
+        return
+    power_guard()
+    print('警告：启用后，连续停电30分钟将实际关闭整个 PVE！')
+    if input('请输入“启用真实关机”以确认：').strip() != '启用真实关机':
+        print('已取消。')
+        return
+    power_guard()  # 确认前后各检查一次，尽量避免停电期间切换
+    update_config('live', 1800)
+
+
+def change_dry():
+    _, mode, timeout = settings()
+    if mode == 'dry-run':
+        print(f'当前已是模拟模式，模拟阈值 {timeout} 秒。')
+        return
+    update_config('dry-run', 30)
+    print('已切到模拟模式；到期只记录日志，不会关机。')
+
+
+def change_sim_timeout(n):
+    if not (5 <= n <= 3600):
+        raise ConfigError('模拟阈值允许5～3600秒')
+    _, mode, _ = settings()
+    if mode != 'dry-run':
+        raise ConfigError('当前是真实关机模式，请先切换至模拟模式再调整模拟阈值')
+    update_config('dry-run', n)
+
+
+def change_interval(n):
+    if not (5 <= n <= 20):
+        raise ConfigError('检测间隔允许5～20秒；更长的间隔可能触发45秒连续性保护')
+    power_guard()
+    timer_was_active = cmd('systemctl', 'is-active', TIMER, check=False,
+                           capture=True).returncode == 0
+    old = DROPIN.read_bytes() if DROPIN.exists() else None
+    old_mode = stat.S_IMODE(DROPIN.stat().st_mode) if DROPIN.exists() else 0o644
+    new = ('[Timer]\nOnUnitInactiveSec=\n'
+           f'OnUnitInactiveSec={n}s\n')
+    atomic_write(DROPIN, new, old_mode)
+    try:
+        cmd('systemctl', 'daemon-reload')
+        # 只更新已经在运行的定时器；已暂停的监控不得被意外启动
+        if timer_was_active:
+            cmd('systemctl', 'restart', TIMER)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        if old is None:
+            DROPIN.unlink(missing_ok=True)
+        else:
+            atomic_write(DROPIN, old.decode('utf-8'), old_mode)
+        cmd('systemctl', 'daemon-reload', check=False)
+        if timer_was_active:
+            cmd('systemctl', 'restart', TIMER, check=False)
+        raise ConfigError('定时器更新失败，已尝试恢复原配置；请检查 systemctl status')
+    print(f'监测间隔已设为 {n} 秒；timer 已重新加载。')
+    print('若当前正在倒计时，改变间隔可能导致计时重置。')
+
+
+def timer_interval():
+    # systemd cat 输出原配置以及 drop-in；后出现的取代前者
+    r = cmd('systemctl', 'cat', TIMER, check=False, timeout=8, capture=True)
+    vals = re.findall(r'^OnUnitInactiveSec=(\d+)s\s*$', r.stdout, re.M)
+    return (vals[-1] + ' 秒') if vals else '未知'
+
+
+def status():
+    _, mode, seconds = settings()
+    label = '真实关机' if mode == 'live' else '模拟（绝不会因阈值触发关机）'
+    print('\n===== PVE UPS 管理状态 =====')
+    print('模式：', label)
+    print(f'停电阈值：{seconds} 秒（{seconds / 60:g} 分钟）')
+    print('检测间隔：', timer_interval())
+    for what, args in [('开机自启', ('systemctl', 'is-enabled', TIMER)),
+                       ('当前定时器', ('systemctl', 'is-active', TIMER))]:
+        r = cmd(*args, check=False, timeout=8, capture=True)
+        print(f'{what}：{r.stdout.strip() or "未知"}')
+    try:
+        value = read_ups()
+        print('UPS：', '正在电池供电' if value else '未放电（通常为市电正常）')
+    except (ConfigError, subprocess.TimeoutExpired) as exc:
+        print(f'UPS：读取失败：{exc}')
+    try:
+        data = json.loads(STATE.read_text())
+        last = time.monotonic() - float(data['last'])
+        if (0 <= last <= 45 and data.get('mode') == mode and
+                int(data.get('timeout', -1)) == seconds):
+            elapsed = max(0, int(time.monotonic() - float(data['since'])))
+            print(f'倒计时：已记录 {elapsed} 秒；剩余约 {max(0, seconds - elapsed)} 秒')
+        else:
+            print('倒计时：状态已过期，须以监控服务下一次输出为准')
+    except (OSError, ValueError, TypeError, KeyError):
+        print('倒计时：无有效记录')
+    print('===========================\n')
+
+
+def pause():
+    print('注意：停用定时器后，PVE 将不再受 UPS 自动关机保护！')
+    if input('请输入“暂停UPS保护”确认：').strip() != '暂停UPS保护':
+        print('已取消。')
+        return
+    cmd('systemctl', 'disable', '--now', TIMER)
+    print('已停用监控及开机自启。')
+
+
+def resume():
+    # 恢复监控不应依赖市电存在，停电期间也应允许恢复保护。
+    cmd('systemctl', 'enable', '--now', TIMER)
+    print('已启用监控及开机自启。')
+
+
+def logs():
+    cmd('journalctl', '-u', SERVICE, '-n', '35', '--no-pager', '-o', 'cat', check=False)
+
+
+def menu():
+    options = '''\n==== PVE UPS 统一管理 ====\n1. 查看运行状态\n2. 读取 UPS 实时状态\n3. 启用真实关机（停电30分钟）\n4. 切换模拟模式（不关机）\n5. 修改模拟倒计时（5～3600秒）\n6. 修改监测间隔（5～20秒）\n7. 查看最近35条日志\n8. 暂停监控（危险操作）\n9. 恢复监控\n0. 退出\n请选择：'''
+    while True:
+        try:
+            choice = input(options).strip()
+            if choice == '0':
+                return
+            if choice == '1':
+                status()
+            elif choice == '2':
+                value = read_ups()
+                print('UPS 当前：', '电池供电' if value else '未放电')
+            elif choice == '3':
+                change_live()
+            elif choice == '4':
+                change_dry()
+            elif choice == '5':
+                change_sim_timeout(int(input('模拟倒计时秒数：').strip()))
+            elif choice == '6':
+                change_interval(int(input('监测间隔秒数：').strip()))
+            elif choice == '7':
+                logs()
+            elif choice == '8':
+                pause()
+            elif choice == '9':
+                resume()
+            else:
+                print('无效选项。')
+        except (ConfigError, OSError, ValueError, subprocess.CalledProcessError,
+                subprocess.TimeoutExpired) as exc:
+            print(f'操作未完成：{exc}', file=sys.stderr)
+        except (EOFError, KeyboardInterrupt):
+            print('\n已退出。')
+            return
+
+
+def main(argv):
+    require_installed()
+    if not argv or argv == ['config']:
+        menu()
+    elif argv == ['status']:
+        status()
+    elif argv == ['probe']:
+        print('UPS 当前：', '电池供电' if read_ups() else '未放电')
+    elif argv == ['logs']:
+        logs()
+    elif argv == ['dry-run']:
+        change_dry()
+    elif argv == ['live']:
+        change_live()
+    elif len(argv) == 2 and argv[0] == 'interval':
+        change_interval(int(argv[1]))
+    elif len(argv) == 2 and argv[0] == 'simulate':
+        change_sim_timeout(int(argv[1]))
+    elif argv == ['pause']:
+        pause()
+    elif argv == ['resume']:
+        resume()
+    else:
+        print('用法：pve-ups [config|status|probe|logs|dry-run|live|simulate 秒|interval 秒|pause|resume]',
+              file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except (ConfigError, OSError, ValueError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired) as e:
+        print(f'未完成：{e}', file=sys.stderr)
+        sys.exit(1)
